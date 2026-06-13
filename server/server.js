@@ -9,6 +9,7 @@ const playerRoutes = require('./routes/player');
 const battleRoutes = require('./routes/battles');
 const leaderboardRoutes = require('./routes/leaderboard');
 const campaignRoutes = require('./routes/campaign');
+const matchmakingRoutes = require('./routes/matchmaking');
 
 const app = express();
 const server = http.createServer(app);
@@ -26,37 +27,75 @@ app.use('/api/player', playerRoutes);
 app.use('/api/battles', battleRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api/campaign', campaignRoutes);
+app.use('/api/matchmaking', matchmakingRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// WebSocket connections
-const battles = new Map();
+// WebSocket connections for real-time battles
+const activeSessions = new Map(); // userId -> ws
+const battleRooms = new Map(); // battleId -> {players: Set, battleState}
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  console.log('WebSocket client connected');
+  let userId = null;
+  let battleId = null;
 
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-      console.log('Received:', data);
+      console.log('WebSocket message:', data.type);
 
-      if (data.type === 'join_battle') {
-        const { battleId } = data;
-        if (!battles.has(battleId)) {
-          battles.set(battleId, new Set());
+      if (data.type === 'auth') {
+        userId = data.userId;
+        activeSessions.set(userId, ws);
+        ws.send(JSON.stringify({ type: 'auth_success' }));
+      } 
+      else if (data.type === 'join_battle') {
+        battleId = data.battleId;
+        if (!battleRooms.has(battleId)) {
+          battleRooms.set(battleId, { players: new Set(), battleState: {} });
         }
-        battles.get(battleId).add(ws);
+        const room = battleRooms.get(battleId);
+        room.players.add(ws);
         ws.battleId = battleId;
-      } else if (data.type === 'battle_action') {
-        const { battleId, action } = data;
-        if (battles.has(battleId)) {
-          battles.get(battleId).forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ type: 'action', action }));
+        
+        // Notify both players that battle is ready
+        room.players.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'battle_ready', battleId }));
+          }
+        });
+      }
+      else if (data.type === 'battle_action') {
+        if (battleId && battleRooms.has(battleId)) {
+          const room = battleRooms.get(battleId);
+          // Broadcast action to all players in battle
+          room.players.forEach(client => {
+            if (client.readyState === WebSocket.OPEN && client !== ws) {
+              client.send(JSON.stringify({ 
+                type: 'opponent_action',
+                action: data.action,
+                turn: data.turn
+              }));
             }
           });
+        }
+      }
+      else if (data.type === 'battle_end') {
+        if (battleId && battleRooms.has(battleId)) {
+          const room = battleRooms.get(battleId);
+          room.players.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ 
+                type: 'battle_ended',
+                result: data.result
+              }));
+            }
+          });
+          // Clean up battle room after a delay
+          setTimeout(() => battleRooms.delete(battleId), 5000);
         }
       }
     } catch (err) {
@@ -65,17 +104,22 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (ws.battleId && battles.has(ws.battleId)) {
-      battles.get(ws.battleId).delete(ws);
-      if (battles.get(ws.battleId).size === 0) {
-        battles.delete(ws.battleId);
+    if (userId) {
+      activeSessions.delete(userId);
+    }
+    if (battleId && battleRooms.has(battleId)) {
+      const room = battleRooms.get(battleId);
+      room.players.delete(ws);
+      if (room.players.size === 0) {
+        battleRooms.delete(battleId);
       }
     }
-    console.log('Client disconnected');
+    console.log('WebSocket client disconnected');
   });
 });
 
 server.listen(PORT, () => {
   console.log(`Elementara server running on port ${PORT}`);
   console.log(`WebSocket available at ws://localhost:${PORT}`);
+  console.log(`Matchmaking system active`);
 });
